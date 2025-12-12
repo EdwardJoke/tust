@@ -5,6 +5,8 @@ use std::process::Command;
 
 use clap::Parser;
 use colored::Colorize;
+use log::{debug, error, info, warn};
+use env_logger;
 use tempfile;
 
 #[derive(Parser, Debug)]
@@ -19,81 +21,166 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    // Initialize the logger
+    env_logger::init();
+    
     let args = Args::parse();
     
     // Handle --clean flag
     if args.clean {
-        clean_temporary_directories().expect("Failed to clean temporary directories");
-        println!("{}", "Cleanup completed successfully".green());
+        info!("Starting cleanup of temporary directories");
+        match clean_temporary_directories() {
+            Ok(()) => {
+                info!("Cleanup completed successfully");
+                println!("{}", "Cleanup completed successfully".green());
+            }
+            Err(e) => {
+                error!("Failed to clean temporary directories: {}", e);
+                eprintln!("{}", format!("Error: Failed to clean temporary directories: {}", e).red());
+                std::process::exit(1);
+            }
+        }
         return;
     }
     
     if args.command.is_empty() {
+        error!("No command provided");
         eprintln!("{}", "Error: No command provided".red());
         std::process::exit(1);
     }
     
+    info!("Executing command: {:?}", args.command);
+    
     // Get current directory
-    let current_dir = std::env::current_dir().expect("Failed to get current directory");
+    let current_dir = match std::env::current_dir() {
+        Ok(dir) => {
+            info!("Current directory: {}", dir.display());
+            dir
+        }
+        Err(e) => {
+            error!("Failed to get current directory: {}", e);
+            eprintln!("{}", format!("Error: Failed to get current directory: {}", e).red());
+            std::process::exit(1);
+        }
+    };
     
     // Create temporary directory with prefix for easy identification
-    let temp_dir = tempfile::Builder::new()
+    let temp_dir = match tempfile::Builder::new()
         .prefix("tust-")
-        .tempdir()
-        .expect("Failed to create temporary directory");
+        .tempdir() {
+        Ok(dir) => {
+            let temp_path = dir.path();
+            info!("Created temporary directory: {}", temp_path.display());
+            dir
+        }
+        Err(e) => {
+            error!("Failed to create temporary directory: {}", e);
+            eprintln!("{}", format!("Error: Failed to create temporary directory: {}", e).red());
+            std::process::exit(1);
+        }
+    };
     let temp_path = temp_dir.path();
     
+    info!("Copying current directory contents to temporary directory");
     println!("{}", "Testing command in temporary directory...".yellow());
     
     // Copy current directory contents to temporary directory
-    copy_directory(&current_dir, temp_path).expect("Failed to copy directory contents");
-    
-    // Run the command in the temporary directory
-    let status = Command::new(&args.command[0])
-        .args(&args.command[1..])
-        .current_dir(temp_path)
-        .status()
-        .expect("Failed to execute command");
-    
-    if !status.success() {
-        eprintln!("{}", format!("Command failed with exit code: {}", status.code().unwrap_or(-1)).red());
-        std::process::exit(status.code().unwrap_or(1));
+    if let Err(e) = copy_directory(&current_dir, temp_path) {
+        error!("Failed to copy directory contents: {}", e);
+        eprintln!("{}", format!("Error: Failed to copy directory contents: {}", e).red());
+        std::process::exit(1);
     }
     
+    // Run the command in the temporary directory
+    info!("Running command in temporary directory: {:?}", args.command);
+    let status = match Command::new(&args.command[0])
+        .args(&args.command[1..])
+        .current_dir(temp_path)
+        .status() {
+        Ok(status) => status,
+        Err(e) => {
+            error!("Failed to execute command: {}", e);
+            eprintln!("{}", format!("Error: Failed to execute command: {}", e).red());
+            std::process::exit(1);
+        }
+    };
+    
+    if !status.success() {
+        let exit_code = status.code().unwrap_or(-1);
+        error!("Command failed with exit code: {}", exit_code);
+        eprintln!("{}", format!("Command failed with exit code: {}", exit_code).red());
+        std::process::exit(exit_code);
+    }
+    
+    info!("Command executed successfully");
+    
     // Compare directories to find changes
-    let changes = compare_directories(&current_dir, temp_path)
-        .expect("Failed to compare directories");
+    info!("Comparing directories to find changes");
+    let changes = match compare_directories(&current_dir, temp_path) {
+        Ok(changes) => {
+            info!("Found {} changes", changes.len());
+            changes
+        }
+        Err(e) => {
+            error!("Failed to compare directories: {}", e);
+            eprintln!("{}", format!("Error: Failed to compare directories: {}", e).red());
+            std::process::exit(1);
+        }
+    };
     
     if changes.is_empty() {
+        info!("No changes would be made");
         println!("{}", "No changes would be made".green());
         return;
     }
     
     // Display changes to user
+    info!("Displaying {} changes to user", changes.len());
     println!("{}", "\nChanges that would be made:".blue().bold());
     for change in &changes {
         match change {
-            Change::Create(path) => println!("  {}{}", "+".green(), path.display()),
-            Change::Modify(path) => println!("  {}{}", "~".yellow(), path.display()),
-            Change::Delete(path) => println!("  {}{}", "-".red(), path.display()),
+            Change::Create(path) => {
+                debug!("Would create: {}", path.display());
+                println!("  {}{}", "+ ".green(), path.display());
+            }
+            Change::Modify(path) => {
+                debug!("Would modify: {}", path.display());
+                println!("  {}{}", "~ ".yellow(), path.display());
+            }
+            Change::Delete(path) => {
+                debug!("Would delete: {}", path.display());
+                println!("  {}{}", "- ".red(), path.display());
+            }
         }
     }
     
     // Ask for user confirmation
+    info!("Asking user for confirmation");
     println!("\n{}", "Would you like to apply these changes? (y/n)".yellow());
     
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).expect("Failed to read input");
+    if let Err(e) = std::io::stdin().read_line(&mut input) {
+        error!("Failed to read input: {}", e);
+        eprintln!("{}", format!("Error: Failed to read input: {}", e).red());
+        std::process::exit(1);
+    }
     
     if input.trim().to_lowercase() != "y" {
+        info!("User aborted the operation");
         println!("{}", "Aborted".red());
         return;
     }
     
-    // Apply changes to original directory
-    apply_changes(&current_dir, temp_path, &changes)
-        .expect("Failed to apply changes");
+    info!("User confirmed, applying {} changes", changes.len());
     
+    // Apply changes to original directory
+    if let Err(e) = apply_changes(&current_dir, temp_path, &changes) {
+        error!("Failed to apply changes: {}", e);
+        eprintln!("{}", format!("Error: Failed to apply changes: {}", e).red());
+        std::process::exit(1);
+    }
+    
+    info!("Changes applied successfully");
     println!("{}", "Changes applied successfully".green());
 }
 
@@ -225,6 +312,7 @@ fn apply_changes(
 fn clean_temporary_directories() -> std::io::Result<()> {
     // Get the system temporary directory
     let temp_dir = std::env::temp_dir();
+    debug!("Scanning temporary directory: {}", temp_dir.display());
     let mut cleaned_count = 0;
     
     // Iterate through all entries in the temporary directory
@@ -237,16 +325,26 @@ fn clean_temporary_directories() -> std::io::Result<()> {
             if let Some(dir_name) = entry_path.file_name() {
                 if let Some(dir_name_str) = dir_name.to_str() {
                     if dir_name_str.starts_with("tust-") {
+                        debug!("Found tust temporary directory: {}", entry_path.display());
                         // Delete the directory and its contents
-                        fs::remove_dir_all(&entry_path)?;
-                        cleaned_count += 1;
-                        println!("  {}{}", "-".red(), entry_path.display());
+                        match fs::remove_dir_all(&entry_path) {
+                            Ok(()) => {
+                                cleaned_count += 1;
+                                info!("Deleted temporary directory: {}", entry_path.display());
+                                println!("  {}{}", "-".red(), entry_path.display());
+                            }
+                            Err(e) => {
+                                warn!("Failed to delete temporary directory {}: {}", entry_path.display(), e);
+                                eprintln!("  {}{}: {}", "!".yellow(), entry_path.display(), e);
+                            }
+                        }
                     }
                 }
             }
         }
     }
     
+    info!("Cleaned up {} temporary directories", cleaned_count);
     println!("{}", format!("Cleaned up {} temporary directories", cleaned_count).blue());
     Ok(())
 }
