@@ -12,3 +12,6 @@ build
 
 # Test directory
 test
+
+# RustRover project directory
+.idea
